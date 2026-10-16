@@ -1,0 +1,285 @@
+const roomInput = document.getElementById('roomInput');
+const nameInput = document.getElementById('nameInput');
+const joinBtn = document.getElementById('joinBtn');
+const leaveBtn = document.getElementById('leaveBtn');
+const screenShareBtn = document.getElementById('screenShareBtn');
+const muteBtn = document.getElementById('muteBtn');
+const requestControlBtn = document.getElementById('requestControlBtn');
+const chatBox = document.getElementById('chatBox');
+const chatInput = document.getElementById('chatInput');
+const sendChatBtn = document.getElementById('sendChatBtn');
+const statusText = document.getElementById('statusText');
+const localVideo = document.getElementById('localVideo');
+const remoteVideo = document.getElementById('remoteVideo');
+
+let roomCode = '';
+let userName = '';
+let localStream = null;
+let peers = {};
+let connection = null;
+let muted = false;
+let remoteControlGranted = false;
+let targetConnectionId = null;
+
+async function addChatMessage(sender, message, type = 'remote') {
+    const line = document.createElement('div');
+    line.className = type;
+    line.textContent = `${sender}: ${message}`;
+    chatBox.appendChild(line);
+    chatBox.scrollTop = chatBox.scrollHeight;
+}
+
+function updateStatus(text) {
+    statusText.textContent = text;
+}
+
+function createPeerConnection(remoteConnectionId) {
+    const pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    });
+
+    pc.onicecandidate = (event) => {
+        if (event.candidate && connection) {
+            connection.invoke('SendIceCandidate', roomCode, remoteConnectionId, JSON.stringify(event.candidate));
+        }
+    };
+
+    pc.ontrack = (event) => {
+        if (remoteVideo.srcObject !== event.streams[0]) {
+            remoteVideo.srcObject = event.streams[0];
+        }
+    };
+
+    pc.ondatachannel = (event) => {
+        const channel = event.channel;
+        channel.onmessage = (ev) => {
+            const data = JSON.parse(ev.data);
+            console.log('Data channel message', data);
+            if (data.type === 'mouse' || data.type === 'keyboard') {
+                addChatMessage('Remote Control', `Received ${data.type} event`, 'system');
+            }
+        };
+    };
+
+    if (localStream) {
+        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+    }
+
+    peers[remoteConnectionId] = pc;
+    return pc;
+}
+
+async function startLocalMedia() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        alert('This browser does not support camera/mic access.');
+        return;
+    }
+
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        localStream = stream;
+        localVideo.srcObject = stream;
+    } catch (err) {
+        console.error('Microphone/camera failed', err);
+        alert('Camera and mic access denied.');
+    }
+}
+
+async function joinRoom() {
+    roomCode = roomInput.value.trim();
+    userName = nameInput.value.trim() || 'Guest';
+
+    if (!roomCode) {
+        alert('Please enter a room code.');
+        return;
+    }
+
+    connection = new signalR.HubConnectionBuilder()
+        .withUrl('/meetingHub')
+        .withAutomaticReconnect()
+        .build();
+
+    connection.on('RoomFull', () => {
+        alert('Room is full. Maximum 10 users.');
+        updateStatus('Room full');
+    });
+
+    connection.on('UserJoined', (joinedUserName, joinedConnectionId) => {
+        addChatMessage('System', `${joinedUserName} joined the room`, 'system');
+        if (joinedConnectionId === connection.connectionId) return;
+
+        const pc = createPeerConnection(joinedConnectionId);
+        const dataChannel = pc.createDataChannel('control');
+        dataChannel.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            addChatMessage('Control', `Received control event: ${data.type}`, 'system');
+        };
+
+        pc.createOffer()
+            .then(offer => pc.setLocalDescription(offer))
+            .then(() => {
+                connection.invoke('SendOffer', roomCode, joinedConnectionId, pc.localDescription.sdp);
+            })
+            .catch(err => console.error('Offer failed', err));
+    });
+
+    connection.on('UserLeft', (leftConnectionId) => {
+        const pc = peers[leftConnectionId];
+        if (pc) {
+            pc.close();
+            delete peers[leftConnectionId];
+        }
+        addChatMessage('System', `User left`, 'system');
+    });
+
+    connection.on('ReceiveOffer', async (fromConnectionId, sdp) => {
+        const pc = peers[fromConnectionId] || createPeerConnection(fromConnectionId);
+        await pc.setRemoteDescription({ type: 'offer', sdp });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        await connection.invoke('SendAnswer', roomCode, fromConnectionId, answer.sdp);
+    });
+
+    connection.on('ReceiveAnswer', async (fromConnectionId, sdp) => {
+        const pc = peers[fromConnectionId];
+        if (pc) {
+            await pc.setRemoteDescription({ type: 'answer', sdp });
+        }
+    });
+
+    connection.on('ReceiveIceCandidate', async (fromConnectionId, candidateJson) => {
+        const pc = peers[fromConnectionId];
+        if (pc && candidateJson) {
+            try {
+                await pc.addIceCandidate(JSON.parse(candidateJson));
+            } catch (err) {
+                console.error('ICE add failed', err);
+            }
+        }
+    });
+
+    connection.on('ChatMessage', (sender, message) => {
+        addChatMessage(sender, message, sender === userName ? 'self' : 'remote');
+    });
+
+    connection.on('MuteChanged', (user, mutedState) => {
+        addChatMessage('System', `${user} ${mutedState ? 'muted' : 'unmuted'}`, 'system');
+    });
+
+    connection.on('ControlRequested', (requesterName, requestConnectionId) => {
+        addChatMessage('System', `${requesterName} wants control`, 'system');
+        const shouldAllow = window.confirm(`${requesterName} wants to take remote control. Allow?`);
+        if (shouldAllow) {
+            connection.invoke('GrantControl', roomCode, requestConnectionId, userName);
+        }
+    });
+
+    connection.on('ControlGranted', (grantedBy) => {
+        remoteControlGranted = true;
+        addChatMessage('System', `Control granted by ${grantedBy}`, 'system');
+        updateStatus('Remote control enabled');
+    });
+
+    connection.on('ControlRevoked', () => {
+        remoteControlGranted = false;
+        addChatMessage('System', 'Control revoked', 'system');
+        updateStatus('Control revoked');
+    });
+
+    connection.on('ReceiveControlEvent', (senderConnectionId, payloadJson) => {
+        const payload = JSON.parse(payloadJson);
+        addChatMessage('System', `${senderConnectionId} sent ${payload.type} event`, 'system');
+    });
+
+    try {
+        await connection.start();
+        await connection.invoke('JoinRoom', roomCode, userName);
+        await startLocalMedia();
+        updateStatus(`Connected to room: ${roomCode}`);
+        addChatMessage('System', `You joined room ${roomCode}`, 'self');
+    } catch (err) {
+        console.error('SignalR start failed', err);
+        alert('Could not connect to hub.');
+    }
+}
+
+async function sendChat() {
+    if (!connection || !roomCode) return;
+    const message = chatInput.value.trim();
+    if (!message) return;
+    await connection.invoke('SendChat', roomCode, userName, message);
+    chatInput.value = '';
+}
+
+async function toggleMute() {
+    if (!connection) return;
+    muted = !muted;
+    const stream = localVideo.srcObject;
+    if (stream) {
+        stream.getAudioTracks().forEach(track => {
+            track.enabled = !muted;
+        });
+    }
+    muteBtn.textContent = muted ? 'Unmute' : 'Mute';
+    await connection.invoke('ToggleMute', roomCode, userName, muted);
+}
+
+async function screenShare() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+        alert('Screen sharing not supported in this browser.');
+        return;
+    }
+
+    try {
+        const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+        Object.values(peers).forEach(pc => {
+            screenStream.getVideoTracks().forEach(track => {
+                const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+                if (sender) {
+                    pc.replaceTrack(sender, track);
+                } else {
+                    pc.addTrack(track, screenStream);
+                }
+            });
+        });
+        addChatMessage('System', 'Screen share started', 'system');
+    } catch (err) {
+        console.error('Screen share failed', err);
+    }
+}
+
+async function requestControl() {
+    if (!connection || !targetConnectionId) {
+        alert('Select a peer target first by joining and connecting to another user.');
+        return;
+    }
+
+    await connection.invoke('RequestControl', roomCode, userName, targetConnectionId);
+    addChatMessage('System', 'Control request sent', 'system');
+}
+
+joinBtn.addEventListener('click', joinRoom);
+leaveBtn.addEventListener('click', async () => {
+    if (connection) {
+        await connection.invoke('LeaveRoom', roomCode);
+        await connection.stop();
+        connection = null;
+    }
+    updateStatus('Disconnected');
+});
+screenShareBtn.addEventListener('click', screenShare);
+muteBtn.addEventListener('click', toggleMute);
+requestControlBtn.addEventListener('click', requestControl);
+sendChatBtn.addEventListener('click', sendChat);
+chatInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendChat();
+    }
+});
+
+window.addEventListener('beforeunload', async () => {
+    if (connection) {
+        await connection.invoke('LeaveRoom', roomCode);
+    }
+});
